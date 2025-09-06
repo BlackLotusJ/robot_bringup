@@ -1,0 +1,29 @@
+# mapless_mission_params.yaml
+mapless_mission_controller:
+  ros__parameters:
+    auto_start: true
+    mission_timeout: 600.0
+    loop_mission: false
+
+    # LiDAR clustering
+    min_target_range: 0.25
+    max_target_range: 5.0
+    cluster_jump: 0.25
+    min_cluster_points: 4
+    max_cluster_width: 0.7
+    front_fov_deg: 220.0
+
+    # Control
+    standoff_distance: 0.55
+    v_max: 0.32
+    w_max: 0.9
+    k_ang: 1.6
+    k_lin: 0.55
+    ang_deadband_deg: 3.0
+
+    # Color sequence (optional)
+    target_color_order: ["red","blue","green"]
+    require_color_order: false
+
+    analyze_hold_secs: 1.5
+    analyze_timeout_secs: 5.0
