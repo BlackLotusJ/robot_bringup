@@ -1,0 +1,51 @@
+# Mission waypoints configuration for robot_bringup
+# Simple format that works with your existing setup
+
+waypoints:
+  - name: "start_position"
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    task: "wait"
+    duration: 2.0
+
+  - name: "checkpoint_1"
+    x: 2.0
+    y: 1.0
+    yaw: 1.57  # 90 degrees (face left)
+    task: "scan"
+    duration: 5.0
+
+  - name: "checkpoint_2"
+    x: 2.0
+    y: 3.0
+    yaw: 3.14  # 180 degrees (face back)
+    task: "wait"
+    duration: 3.0
+
+  - name: "checkpoint_3"
+    x: 0.0
+    y: 3.0
+    yaw: -1.57  # -90 degrees (face right)
+    task: "scan"
+    duration: 5.0
+
+  - name: "return_home"
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    task: "wait"
+    duration: 2.0
+
+# Mission configuration
+mission_config:
+  name: "Basic Patrol Mission"
+  loop: true
+  timeout: 600.0  # 10 minutes
+
+# Safety parameters
+safety:
+  max_linear_velocity: 0.3  # Conservative for indoor use
+  max_angular_velocity: 0.5
+  battery_threshold: 20.0
+  obstacle_distance: 0.5  # Stop if obstacle closer than 0.5m
