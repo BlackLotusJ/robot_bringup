@@ -1,2 +1,31 @@
 # robot_bringup
 This is the package conytaining the autonoums files for the Jabari Mars Rover
+
+# Balloon Dijkstra Mission Node
+
+## Overview
+This ROS 2 node combines:
+- **LiDAR-based occupancy grid mapping**
+- **Dijkstra path planning**
+- **Balloon mission sequence**: pink → yellow → black → white → blue
+- **Startup yaw acknowledgement** (left–right wiggle before mission)
+- **Exploration fallback** with move-and-scan behavior
+
+It publishes:
+- `/local_map` (`nav_msgs/OccupancyGrid`) → view in RViz2 as a Map
+- `/planned_path` (`nav_msgs/Path`) → view in RViz2 as a Path
+- `/cmd_vel` (`geometry_msgs/Twist`) → sent to robot base
+
+The node subscribes to:
+- `/scan` (`sensor_msgs/LaserScan`) → from RPLiDAR or other 2D laser
+- `/imu/data` (`sensor_msgs/Imu`) → for yaw orientation
+- `/object_info` (`std_msgs/String`) → balloon detections (contains color name)
+
+## Build
+Clone into your workspace:
+```bash
+cd ~/ros2_ws/src
+git clone <this_repo>
+cd ~/ros2_ws
+colcon build --packages-select your_package_name
+source install/setup.bash
