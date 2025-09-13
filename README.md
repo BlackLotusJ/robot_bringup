@@ -1,5 +1,5 @@
 # robot_bringup
-This is the package conytaining the autonoums files for the Jabari Mars Rover
+This is the package conytaining the autonoums mission files for the Jabari Mars Rover
 
 # Balloon Dijkstra Mission Node
 
