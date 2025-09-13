@@ -22,9 +22,9 @@ The node subscribes to:
 Clone into your workspace:
 ```bash
 cd ~/ros2_ws/src
-git clone <this_repo>
+git clone https://github.com/BlackLotusJ/robot_bringup
 cd ~/ros2_ws
-colcon build --packages-select your_package_name
+colcon build --packages-select robot_bringup
 source install/setup.bash
 ```
 ## RViz2 Setup
