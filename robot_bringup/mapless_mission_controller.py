@@ -1,439 +1,388 @@
 #!/usr/bin/env python3
 """
-Mapless Mission Controller for Cars4Mars balloon task
-- Uses LiDAR clusters to seek nearest obstacle (balloon)
-- Approaches to standoff distance
-- Triggers camera to classify color
-- Logs order of colors found, then continues until timeout or no targets
-
-Assumptions:
-- LiDAR publishes /scan (sensor_msgs/LaserScan)
-- Vision node listens on /balloon/trigger (std_msgs/Bool) and publishes /balloon/color (std_msgs/String)
-- Motor stack listens on /cmd_vel (geometry_msgs/Twist)
-- Optional: /emergency_stop (std_msgs/Bool) to stop immediately
-
-Tested with Python 3.10, rclpy, ROS 2 Humble/Jazzy-style APIs
+Mapless Mission Controller with Balloon Sequence (Pink → Green → Yellow)
+Enhanced with move-and-scan behavior and startup yaw acknowledgment
 """
-
-import math
-import time
-from enum import Enum
-from typing import List, Tuple, Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
-
-from std_msgs.msg import String, Bool
-from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+from sensor_msgs.msg import LaserScan, Imu
+import time
+import math
+import numpy as np
 
-class MState(Enum):
-    IDLE = 0
-    SCANNING = 1
-    TARGET_LOCKED = 2
-    APPROACHING = 3
-    ANALYZING = 4
-    LOGGING = 5
-    COMPLETED = 6
-    EMERGENCY_STOP = 7
-    FAILED = 8
 
-class MaplessMissionController(Node):
+class MaplessMissionNode(Node):
     def __init__(self):
-        super().__init__('mapless_mission_controller')
-        self.cb_group = ReentrantCallbackGroup()
+        super().__init__('mapless_mission_node')
 
         # --- Parameters ---
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('auto_start', True),
-                ('mission_timeout', 600.0),
-                ('loop_mission', False),
+        self.declare_parameter('v_max', 0.2)
+        self.declare_parameter('w_max', 0.4)
+        self.declare_parameter('safe_distance', 0.5)
+        self.declare_parameter('retreat_speed', -0.2)
+        self.declare_parameter('stop_duration', 5.0)
+        self.declare_parameter('yaw_gain', 1.5)
+        self.declare_parameter('obstacle_threshold', 0.25)
+        self.declare_parameter('use_lidar', True)
+        self.declare_parameter('scan_speed', 0.15)  # Speed while scanning
+        self.declare_parameter('approach_distance', 1.0)  # Distance to approach obstacles
+        self.declare_parameter('startup_yaw_duration', 4.0)  # Duration for startup yaw motion
 
-                # LiDAR / perception
-                ('min_target_range', 0.2),          # ignore < 20 cm (noise/robot body)
-                ('max_target_range', 4.5),          # rplidar A1 typical useful up to ~6m; tune
-                ('cluster_jump', 0.25),             # range discontinuity threshold for cluster split (m)
-                ('min_cluster_points', 4),          # keep small to catch balloons; tune with your scan res
-                ('max_cluster_width', 0.8),         # max arc length across cluster (m), balloons are small
-                ('front_fov_deg', 200.0),           # allow wide FOV to acquire targets (±100°)
+        # --- Balloon sequence ---
+        self.balloon_sequence = ["pink", "green", "yellow"]
+        self.sequence_index = 0  # start with first target
 
-                # Control
-                ('standoff_distance', 0.6),         # stop this far from cluster center (m)
-                ('v_max', 0.35),
-                ('w_max', 0.8),
-                ('k_ang', 1.8),                     # P-gain for heading
-                ('k_lin', 0.6),                     # P-gain for forward speed
-                ('ang_deadband_deg', 3.0),
-
-                # Balloon color order to find (if set, we’ll prefer next needed color when vision is available)
-                ('target_color_order', ['red', 'blue', 'green']),
-                ('require_color_order', False),     # if True, skip balloons whose color != next in order
-
-                # Analysis timing
-                ('analyze_hold_secs', 1.5),         # time to hold still for camera
-                ('analyze_timeout_secs', 5.0),      # if no color arrives, give up and move on
-            ]
-        )
+        # --- Startup acknowledgment ---
+        self.startup_phase = True
+        self.startup_start_time = time.time()
+        self.initial_yaw = None
+        self.yaw_direction = 1  # 1 for left, -1 for right
+        self.yaw_cycles_completed = 0
+        self.target_yaw_cycles = 2  # Number of left-right cycles
 
         # --- State ---
-        self.state = MState.IDLE
-        self.mission_start = None
-        self.colors_found: List[str] = []
-        self.last_scan: Optional[LaserScan] = None
-        self.target_bearing: Optional[float] = None  # radians, in laser frame
-        self.target_range: Optional[float] = None
-        self.analyze_started = None
+        self.target_detected = None
+        self.visited_balloons = set()
+        self.min_distance_ahead = None
+        self.lidar_ranges = None
+        self.in_stop_phase = False
+        self.stop_start_time = None
 
-        # --- ROS I/O ---
+        # --- Exploration states ---
+        self.exploration_state = "scanning"  # "scanning", "approaching_obstacle", "investigating"
+        self.obstacle_detected = False
+        self.obstacle_direction = None
+        self.investigation_start_time = None
+        self.investigation_duration = 3.0  # Time to spend investigating an object
+        self.last_rotation_time = time.time()
+        self.rotation_interval = 5.0  # Change direction every 5 seconds while scanning
+
+        # IMU / heading
+        self.current_yaw = None
+        self.target_yaw = None
+
+        # --- Publishers ---
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.status_pub = self.create_publisher(String, 'mission/status', 10)
-        self.trigger_pub = self.create_publisher(Bool, 'balloon/trigger', 10)
-        self.estop_pub = self.create_publisher(Bool, 'emergency_stop', 10)  # optional: to notify others
 
-        self.scan_sub = self.create_subscription(
-            LaserScan, 'scan', self.scan_cb, 10, callback_group=self.cb_group
-        )
-        self.color_sub = self.create_subscription(
-            String, 'balloon/color', self.color_cb, 10, callback_group=self.cb_group
-        )
-        self.cmd_sub = self.create_subscription(
-            String, 'mission/command', self.cmd_cb, 10, callback_group=self.cb_group
-        )
-        self.estop_sub = self.create_subscription(
-            Bool, 'emergency_stop', self.estop_cb, 10, callback_group=self.cb_group
-        )
+        # --- Subscribers ---
+        self.create_subscription(String, '/object_info', self.detection_cb, 10)
+        self.create_subscription(LaserScan, '/scan', self.lidar_cb, 10)
+        self.create_subscription(Imu, '/imu/data', self.imu_cb, 10)
 
-        self.timer = self.create_timer(0.05, self.tick)   # 20 Hz control
-        self.status_timer = self.create_timer(0.5, self.pub_status)
+        # --- Timers ---
+        self.timer = self.create_timer(0.2, self.control_loop)
 
-        if self.get_parameter('auto_start').get_parameter_value().bool_value:
-            self.start()
+        self.get_logger().info("✅ Mapless Mission Node (Move and Scan) started...")
+        self.get_logger().info("🤖 Performing startup acknowledgment yaw motion...")
 
-        self.get_logger().info("Mapless Mission Controller ready.")
+    # --- Balloon detection callback ---
+    def detection_cb(self, msg: String):
+        # Don't process detections during startup phase
+        if self.startup_phase:
+            return
+            
+        data = msg.data.lower()
+        current_target = self.get_current_target()
 
-    # ---------- Subscriptions ----------
-    def scan_cb(self, msg: LaserScan):
-        self.last_scan = msg
+        if current_target and current_target in data:
+            if data not in self.visited_balloons:
+                self.target_detected = data
+                self.target_yaw = self.current_yaw
+                self.exploration_state = "approaching_balloon"
+                self.get_logger().info(f"🎯 Target balloon detected: {data}")
+            else:
+                self.get_logger().info(f"⏭ Already visited: {data}")
+        else:
+            if data and data != "none":
+                self.get_logger().info(f"👀 Found {data}, but looking for {current_target}")
+                # Continue investigation for a bit longer to make sure
+                if self.exploration_state == "investigating":
+                    self.investigation_start_time = time.time()
 
-    def color_cb(self, msg: String):
-        # Only consume during ANALYZING
-        if self.state == MState.ANALYZING:
-            color = msg.data.strip().lower()
-            self.get_logger().info(f"Color detected: {color}")
-            self.colors_found.append(color)
-            self.state = MState.LOGGING
+    # --- LiDAR callback ---
+    def lidar_cb(self, msg: LaserScan):
+        if not self.get_parameter('use_lidar').value:
+            return
 
-    def cmd_cb(self, msg: String):
-        cmd = msg.data.strip().lower()
-        if cmd == 'start': self.start()
-        elif cmd == 'stop': self.stop()
-        elif cmd == 'pause': self.state = MState.IDLE; self.halt()
-        elif cmd == 'resume': self.state = MState.SCANNING
-        elif cmd == 'emergency_stop': self.emergency_stop()
+        self.lidar_ranges = msg.ranges
+        center_index = len(msg.ranges) // 2
+        d = msg.ranges[center_index]
+        if math.isinf(d):
+            d = 10.0
+        self.min_distance_ahead = d
 
-    def estop_cb(self, msg: Bool):
-        if msg.data:
-            self.emergency_stop()
+        # Only detect obstacles after startup phase
+        if not self.startup_phase:
+            self.detect_obstacles_for_investigation(msg)
 
-    # ---------- Mission control ----------
-    def start(self):
-        self.mission_start = time.time()
-        self.colors_found.clear()
-        self.state = MState.SCANNING
-        self.get_logger().info("Mission started (mapless).")
+    def detect_obstacles_for_investigation(self, msg: LaserScan):
+        """Detect obstacles that could be balloons to investigate"""
+        approach_distance = self.get_parameter('approach_distance').get_parameter_value().double_value
+
+        if self.exploration_state not in ["scanning"] or self.target_detected:
+            return
+
+        # Look for obstacles in front sector (±30 degrees)
+        ranges = np.array(msg.ranges)
+        center_idx = len(ranges) // 2
+        sector_width = int(len(ranges) * 0.17)  # ±30 degrees approximately
+
+        front_sector = ranges[center_idx - sector_width:center_idx + sector_width]
+        valid_distances = front_sector[~np.isinf(front_sector)]
+
+        if len(valid_distances) > 0:
+            min_dist = np.min(valid_distances)
+            if min_dist < approach_distance and min_dist > 0.1:  # Found something to investigate
+                self.obstacle_detected = True
+                self.exploration_state = "approaching_obstacle"
+                self.get_logger().info(f"🔍 Obstacle detected at {min_dist:.2f}m, investigating...")
+
+    # --- IMU callback ---
+    def imu_cb(self, msg: Imu):
+        q = msg.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        # Store initial yaw for startup sequence
+        if self.initial_yaw is None and self.current_yaw is not None:
+            self.initial_yaw = self.current_yaw
+
+    def angle_diff(self, a, b):
+        d = a - b
+        return math.atan2(math.sin(d), math.cos(d))
+
+    def get_current_target(self):
+        if self.sequence_index < len(self.balloon_sequence):
+            return self.balloon_sequence[self.sequence_index]
+        return None
+
+    def perform_startup_yaw(self):
+        """Perform left-right yaw motion to acknowledge system is working"""
+        if self.current_yaw is None or self.initial_yaw is None:
+            return Twist()  # Wait for IMU data
+            
+        startup_duration = self.get_parameter('startup_yaw_duration').get_parameter_value().double_value
+        w_max = self.get_parameter('w_max').get_parameter_value().double_value
+        
+        current_time = time.time()
+        elapsed_time = current_time - self.startup_start_time
+        
+        cmd = Twist()
+        
+        # Calculate yaw motion using sinusoidal pattern
+        cycle_period = startup_duration / self.target_yaw_cycles  # Time for one left-right cycle
+        yaw_amplitude = math.pi / 4  # ±45 degrees
+        
+        if elapsed_time < startup_duration:
+            # Sinusoidal yaw motion
+            phase = (elapsed_time % cycle_period) / cycle_period * 2 * math.pi
+            target_yaw_offset = yaw_amplitude * math.sin(phase)
+            target_yaw = self.initial_yaw + target_yaw_offset
+            
+            yaw_error = self.angle_diff(target_yaw, self.current_yaw)
+            cmd.angular.z = max(min(2.0 * yaw_error, w_max), -w_max)
+            
+            # Log progress
+            progress = (elapsed_time / startup_duration) * 100
+            if int(elapsed_time * 2) % 2 == 0:  # Log every 0.5 seconds
+                self.get_logger().info(f"🤖 Startup yaw motion: {progress:.0f}% complete")
+                
+        else:
+            # Startup complete - return to initial position
+            yaw_error = self.angle_diff(self.initial_yaw, self.current_yaw)
+            if abs(yaw_error) > 0.1:  # 0.1 radian tolerance (~6 degrees)
+                cmd.angular.z = max(min(2.0 * yaw_error, w_max), -w_max)
+                self.get_logger().info("🎯 Returning to initial orientation...")
+            else:
+                # Startup sequence complete
+                self.startup_phase = False
+                self.get_logger().info("✅ Startup acknowledgment complete! Starting mission...")
+                self.get_logger().info(f"🎯 Looking for first balloon: {self.get_current_target()}")
+                cmd = Twist()  # Stop motion
+        
+        return cmd
+
+    # --- Main control loop ---
+    def control_loop(self):
+        # Handle startup yaw acknowledgment
+        if self.startup_phase:
+            cmd = self.perform_startup_yaw()
+            self.cmd_pub.publish(cmd)
+            return
+
+        cmd = Twist()
+
+        v_max = self.get_parameter('v_max').get_parameter_value().double_value
+        w_max = self.get_parameter('w_max').get_parameter_value().double_value
+        safe_distance = self.get_parameter('safe_distance').get_parameter_value().double_value
+        retreat_speed = self.get_parameter('retreat_speed').get_parameter_value().double_value
+        stop_duration = self.get_parameter('stop_duration').get_parameter_value().double_value
+        yaw_gain = self.get_parameter('yaw_gain').get_parameter_value().double_value
+        obstacle_threshold = self.get_parameter('obstacle_threshold').get_parameter_value().double_value
+        use_lidar = self.get_parameter('use_lidar').value
+        scan_speed = self.get_parameter('scan_speed').get_parameter_value().double_value
+
+        current_target = self.get_current_target()
+
+        # --- If all balloons visited ---
+        if current_target is None:
+            self.get_logger().info("🎉 Mission complete! All balloons visited.")
+            self.cmd_pub.publish(Twist())
+            return
+
+        # --- Stop phase (when balloon is reached) ---
+        if self.in_stop_phase:
+            now = time.time()
+            if now - self.stop_start_time < stop_duration:
+                self.get_logger().info("⏸ Holding at balloon...")
+                cmd.linear.x = 0.0
+            elif now - self.stop_start_time < stop_duration + 1.0:
+                self.get_logger().info("↩ Retreating...")
+                cmd.linear.x = retreat_speed
+            else:
+                self.in_stop_phase = False
+                self.target_detected = None
+                self.target_yaw = None
+                self.sequence_index += 1  # go to next target
+                self.exploration_state = "scanning"
+                next_target = self.get_current_target()
+                if next_target:
+                    self.get_logger().info(f"🔄 Searching for next balloon: {next_target}")
+                else:
+                    self.get_logger().info("🎉 All balloons collected!")
+            self.cmd_pub.publish(cmd)
+            return
+
+        # --- Target balloon approach ---
+        if self.target_detected and self.exploration_state == "approaching_balloon":
+            distance = self.min_distance_ahead if (use_lidar and self.min_distance_ahead is not None) else 1e6
+            self.get_logger().info(f"📏 Distance to {current_target} balloon: {distance:.2f} m")
+
+            # Check if we've reached the target distance (0.5m)
+            if use_lidar and distance <= safe_distance:
+                self.get_logger().info(f"🎈 Reached {current_target} balloon at {distance:.2f}m")
+                self.visited_balloons.add(self.target_detected)
+                self.in_stop_phase = True
+                self.stop_start_time = time.time()
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+            else:
+                # Continue approaching the balloon
+                yaw_error = 0.0
+                if self.current_yaw is not None and self.target_yaw is not None:
+                    yaw_error = self.angle_diff(self.target_yaw, self.current_yaw)
+
+                # Slow down as we get closer to the target
+                speed_factor = min(1.0, (distance - safe_distance + 0.2) / 0.5) if use_lidar else 1.0
+                speed_factor = max(0.1, speed_factor)  # Minimum speed to avoid stopping too early
+                
+                cmd.linear.x = v_max * speed_factor
+                cmd.angular.z = max(min(yaw_gain * yaw_error, w_max), -w_max)
+                self.get_logger().info(f"➡ Approaching {current_target} balloon (dist={distance:.2f}m, speed={speed_factor:.2f})")
+
+
+        # --- Exploration behavior ---
+        else:
+            if self.exploration_state == "scanning":
+                # Move forward while rotating to scan the environment
+                current_time = time.time()
+
+                # Check for obstacles and maintain safe distance
+                if (use_lidar and self.min_distance_ahead is not None and
+                    self.min_distance_ahead <= safe_distance):
+                    self.get_logger().warn(f"⚠ Obstacle at {self.min_distance_ahead:.2f}m - maintaining safe distance of {safe_distance}m")
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = w_max  # Turn to find clear path
+                elif (use_lidar and self.min_distance_ahead is not None and
+                      self.min_distance_ahead < safe_distance + 0.3):
+                    # Slow down when approaching safe distance
+                    speed_factor = (self.min_distance_ahead - safe_distance) / 0.3
+                    speed_factor = max(0.0, min(1.0, speed_factor))
+                    cmd.linear.x = scan_speed * speed_factor
+                    
+                    if current_time - self.last_rotation_time > self.rotation_interval:
+                        self.last_rotation_time = current_time
+                        self.rotation_interval = 3.0 + 4.0 * (time.time() % 1)  # Random 3-7 seconds
+
+                    # Add some rotation while moving
+                    rotation_phase = (current_time - self.last_rotation_time) / self.rotation_interval
+                    cmd.angular.z = 0.3 * math.sin(2 * math.pi * rotation_phase)
+                    
+                    self.get_logger().info(f"🐌 Slowing down near obstacle: {self.min_distance_ahead:.2f}m (speed={speed_factor:.2f})")
+                else:
+                    # Move forward and periodically change direction
+                    cmd.linear.x = scan_speed
+
+                    if current_time - self.last_rotation_time > self.rotation_interval:
+                        self.last_rotation_time = current_time
+                        self.rotation_interval = 3.0 + 4.0 * (time.time() % 1)  # Random 3-7 seconds
+
+                    # Add some rotation while moving
+                    rotation_phase = (current_time - self.last_rotation_time) / self.rotation_interval
+                    cmd.angular.z = 0.3 * math.sin(2 * math.pi * rotation_phase)
+
+                    self.get_logger().info(f"🔍 Scanning for {current_target} balloon...")
+
+            elif self.exploration_state == "approaching_obstacle":
+                # Move towards the detected obstacle but stop at safe distance
+                if (use_lidar and self.min_distance_ahead is not None and
+                    self.min_distance_ahead <= safe_distance):
+                    # Reached safe distance - start investigation
+                    self.exploration_state = "investigating"
+                    self.investigation_start_time = time.time()
+                    self.get_logger().info(f"🔎 Reached obstacle at safe distance ({self.min_distance_ahead:.2f}m) - starting investigation...")
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.0
+                else:
+                    # Keep approaching but slow down as we get closer
+                    if self.min_distance_ahead is not None:
+                        # Progressive speed reduction as we approach safe_distance
+                        speed_factor = min(1.0, (self.min_distance_ahead - safe_distance) / 0.5)
+                        speed_factor = max(0.1, speed_factor)  # Minimum 10% speed
+                        cmd.linear.x = scan_speed * speed_factor
+                        cmd.angular.z = 0.0
+                        self.get_logger().info(f"➡ Approaching obstacle: {self.min_distance_ahead:.2f}m (speed={speed_factor:.2f})")
+                    else:
+                        cmd.linear.x = scan_speed
+                        cmd.angular.z = 0.0
+                        self.get_logger().info("➡ Approaching obstacle for investigation...")
+
+            elif self.exploration_state == "investigating":
+                # Rotate around the object to get a good view
+                current_time = time.time()
+                if current_time - self.investigation_start_time < self.investigation_duration:
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.4  # Slow rotation for investigation
+                    self.get_logger().info("🔎 Investigating object...")
+                else:
+                    # Done investigating, resume scanning
+                    self.exploration_state = "scanning"
+                    self.obstacle_detected = False
+                    self.last_rotation_time = time.time()
+                    self.get_logger().info("📍 Investigation complete, resuming scan...")
+
+        self.cmd_pub.publish(cmd)
 
     def stop(self):
-        self.state = MState.COMPLETED
-        self.halt()
-        self.get_logger().info("Mission stopped.")
-
-    def emergency_stop(self):
-        self.state = MState.EMERGENCY_STOP
-        self.halt()
-        # announce
-        msg = Bool(); msg.data = True
-        self.estop_pub.publish(msg)
-        self.get_logger().error("EMERGENCY STOP ACTIVATED")
-
-    # ---------- Periodic ----------
-    def pub_status(self):
-        status = f"{self.state.name}|colors:{','.join(self.colors_found)}"
-        self.status_pub.publish(String(data=status))
-
-    def tick(self):
-        # timeouts
-        tmo = self.get_parameter('mission_timeout').get_parameter_value().double_value
-        if self.mission_start and (time.time() - self.mission_start) > tmo and self.state not in (MState.COMPLETED, MState.EMERGENCY_STOP):
-            self.get_logger().warn("Mission timeout.")
-            self.state = MState.COMPLETED
-            self.halt()
-            return
-
-        if self.state in (MState.COMPLETED, MState.EMERGENCY_STOP, MState.FAILED, MState.IDLE):
-            self.halt()
-            return
-
-        if self.state == MState.SCANNING:
-            self.seek_target()
-
-        elif self.state == MState.TARGET_LOCKED:
-            # small centering before moving in
-            self.center_on_target(pre_drive=True)
-
-        elif self.state == MState.APPROACHING:
-            self.approach_target()
-
-        elif self.state == MState.ANALYZING:
-            self.halt()
-            self.analyze_phase()
-
-        elif self.state == MState.LOGGING:
-            self.after_logging()
-
-    # ---------- Core behaviors ----------
-    def seek_target(self):
-        if not self.last_scan:
-            self.slow_spin()
-            return
-
-        # cluster scan into small obstacles
-        clusters = self.cluster_scan(self.last_scan)
-
-        if not clusters:
-            # keep rotating to search
-            self.slow_spin()
-            return
-
-        # Choose target: nearest cluster, with optional color-order preference (if we already know next color via prior hints—usually we won't)
-        target = min(clusters, key=lambda c: c[0])  # (range, bearing, width)
-        r, b, w = target
-        self.target_range, self.target_bearing = r, b
-        self.state = MState.TARGET_LOCKED
-        self.get_logger().info(f"Target locked: range={r:.2f} m, bearing={math.degrees(b):.1f}°")
-
-    def center_on_target(self, pre_drive=False):
-        if self.target_bearing is None or self.target_range is None:
-            self.state = MState.SCANNING
-            return
-
-        # rotate to reduce bearing error
-        cmd = Twist()
-        ang_err = self.target_bearing
-        k_ang = self.get_parameter('k_ang').get_parameter_value().double_value
-        w = max(-self.w_max(), min(self.w_max(), k_ang * ang_err))
-        # deadband
-        if abs(math.degrees(ang_err)) < self.get_parameter('ang_deadband_deg').get_parameter_value().double_value:
-            w = 0.0
-
-        if pre_drive:
-            # very small forward nudge to keep engaged with cluster
-            cmd.linear.x = 0.0
-            cmd.angular.z = w
-            self.cmd_pub.publish(cmd)
-            if abs(w) < 0.05:
-                self.state = MState.APPROACHING
-            return
-
-        cmd.angular.z = w
-        self.cmd_pub.publish(cmd)
-
-    def approach_target(self):
-        if not self.last_scan:
-            self.halt()
-            return
-
-        # Re-estimate bearing/range each tick in case target moved in scan
-        clusters = self.cluster_scan(self.last_scan)
-        if not clusters:
-            # lost target, go back to scanning
-            self.get_logger().warn("Lost target; resuming scan.")
-            self.state = MState.SCANNING
-            return
-
-        # pick cluster closest in bearing to previous target to maintain lock
-        prev_b = self.target_bearing if self.target_bearing is not None else 0.0
-        r, b, w = min(clusters, key=lambda c: abs(c[1] - prev_b))
-        self.target_range, self.target_bearing = r, b
-
-        standoff = self.get_parameter('standoff_distance').get_parameter_value().double_value
-        if r <= standoff:
-            self.halt()
-            # Trigger camera to analyze color
-            self.trigger_camera(True)
-            self.analyze_started = time.time()
-            self.state = MState.ANALYZING
-            self.get_logger().info("At standoff: analyzing color...")
-            return
-
-        # Drive with simple P-control
-        cmd = Twist()
-        k_lin = self.get_parameter('k_lin').get_parameter_value().double_value
-        k_ang = self.get_parameter('k_ang').get_parameter_value().double_value
-
-        ang_err = b
-        cmd.angular.z = max(-self.w_max(), min(self.w_max(), k_ang * ang_err))
-
-        # reduce speed as we near standoff
-        dist_err = max(0.0, r - standoff)
-        v = k_lin * dist_err
-        v = max(0.0, min(self.v_max(), v))
-        # also slow down if misaligned
-        v *= max(0.0, 1.0 - min(1.0, abs(ang_err) / math.radians(45)))
-        cmd.linear.x = v
-
-        self.cmd_pub.publish(cmd)
-
-    def analyze_phase(self):
-        if self.analyze_started is None:
-            self.analyze_started = time.time()
-
-        hold = self.get_parameter('analyze_hold_secs').get_parameter_value().double_value
-        tmo  = self.get_parameter('analyze_timeout_secs').get_parameter_value().double_value
-
-        elapsed = time.time() - self.analyze_started
-
-        # Hold still for the first bit to get a clean frame
-        if elapsed < hold:
-            return
-
-        # If color already arrived, LOGGING state will handle it
-        # If not arrived by timeout, give up and move on
-        if elapsed > tmo:
-            self.get_logger().warn("Color analysis timed out; moving on.")
-            self.state = MState.LOGGING
-
-    def after_logging(self):
-        # Stop triggering camera
-        self.trigger_camera(False)
-
-        # If we enforce a color order, check it
-        enforce = self.get_parameter('require_color_order').get_parameter_value().bool_value
-        if enforce:
-            order = [s.lower() for s in self.get_parameter('target_color_order').get_parameter_value().string_array_value]
-            next_needed = order[len([c for c in self.colors_found if c in order]) % len(order)]
-            if self.colors_found and self.colors_found[-1] != next_needed:
-                self.get_logger().info(f"Detected '{self.colors_found[-1]}' but expected '{next_needed}'. Continuing search.")
-
-        # Decide to continue or complete
-        if self.should_complete():
-            self.state = MState.COMPLETED
-            self.halt()
-            self.get_logger().info(f"Mission completed. Colors: {self.colors_found}")
-        else:
-            # Reset target and scan for the next
-            self.target_bearing = None
-            self.target_range = None
-            self.state = MState.SCANNING
-
-    def should_complete(self) -> bool:
-        # If enforcing order, complete after we’ve seen all in order at least once
-        enforce = self.get_parameter('require_color_order').get_parameter_value().bool_value
-        if enforce:
-            order = [s.lower() for s in self.get_parameter('target_color_order').get_parameter_value().string_array_value]
-            found_seq = [c for c in self.colors_found if c in order]
-            return len(found_seq) >= len(order)
-
-        # Otherwise, stop if timeout occurred (handled earlier) or if not looping we can keep going forever.
-        return False
-
-    # ---------- Helpers ----------
-    def v_max(self) -> float:
-        return self.get_parameter('v_max').get_parameter_value().double_value
-
-    def w_max(self) -> float:
-        return self.get_parameter('w_max').get_parameter_value().double_value
-
-    def halt(self):
         self.cmd_pub.publish(Twist())
 
-    def slow_spin(self, speed: float = 0.25):
-        cmd = Twist()
-        cmd.angular.z = speed
-        self.cmd_pub.publish(cmd)
-
-    def trigger_camera(self, on: bool):
-        msg = Bool(); msg.data = bool(on)
-        self.trigger_pub.publish(msg)
-
-    # LiDAR clustering tuned for small, roundish obstacles (balloons)
-    def cluster_scan(self, scan: LaserScan) -> List[Tuple[float, float, float]]:
-        """
-        Returns list of clusters as (range_m, bearing_rad, width_m)
-        Only within front_fov and range limits; filters by cluster size/width.
-        """
-        angle_min = scan.angle_min
-        angle_inc = scan.angle_increment
-        ranges = list(scan.ranges)
-
-        # FOV window
-        fov_deg = float(self.get_parameter('front_fov_deg').get_parameter_value().double_value)
-        half = math.radians(fov_deg / 2.0)
-        # indices within [-half, +half]
-        idx_min = max(0, int(( -half - angle_min) / angle_inc))
-        idx_max = min(len(ranges)-1, int(( +half - angle_min) / angle_inc))
-        if idx_min >= idx_max:
-            idx_min, idx_max = 0, len(ranges)-1
-
-        rmin = self.get_parameter('min_target_range').get_parameter_value().double_value
-        rmax = self.get_parameter('max_target_range').get_parameter_value().double_value
-        jump = self.get_parameter('cluster_jump').get_parameter_value().double_value
-        min_pts = int(self.get_parameter('min_cluster_points').get_parameter_value().integer_value)
-        max_width = self.get_parameter('max_cluster_width').get_parameter_value().double_value
-
-        clusters: List[Tuple[float, float, float]] = []
-        cur: List[Tuple[int, float]] = []
-
-        def flush_cluster():
-            nonlocal clusters, cur
-            if len(cur) < max(2, min_pts):
-                cur = []
-                return
-            # compute centroid in polar and estimate arc width
-            idxs = [i for (i, r) in cur]
-            rs   = [r for (i, r) in cur]
-            angs = [angle_min + i*angle_inc for i in idxs]
-
-            r_avg = sum(rs)/len(rs)
-            a_avg = math.atan2(sum(math.sin(a) for a in angs), sum(math.cos(a) for a in angs))
-            # approximate arc width
-            a_span = max(angs) - min(angs)
-            width = r_avg * abs(a_span)
-            if rmin <= r_avg <= rmax and width <= max_width:
-                clusters.append((r_avg, a_avg, width))
-            cur = []
-
-        prev_r = None
-        for i in range(idx_min, idx_max+1):
-            r = ranges[i]
-            if math.isfinite(r) and rmin <= r <= rmax:
-                if prev_r is None or abs(r - prev_r) < jump:
-                    cur.append((i, r))
-                else:
-                    flush_cluster()
-                    cur = [(i, r)]
-                prev_r = r
-            else:
-                flush_cluster()
-                prev_r = None
-                cur = []
-        flush_cluster()
-
-        return clusters
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MaplessMissionController()
+    node = MaplessMissionNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.halt()
+        node.stop()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
