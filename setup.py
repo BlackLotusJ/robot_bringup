@@ -6,7 +6,7 @@ package_name = 'robot_bringup'
 
 setup(
     name=package_name,
-    version='0.0.1',
+    version='0.0.2',
     packages=[package_name],
     py_modules=[],
     data_files=[
@@ -35,13 +35,15 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='pi',
-    maintainer_email='jerrykiche61@gamil.com',
+    maintainer_email='jerrykiche61@gmail.com',
     description='Bringup package for robot with LiDAR + IMU + SLAM',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
             'mapless_mission_controller = robot_bringup.mapless_mission_controller:main',
             'mission_controller = robot_bringup.mission_controller:main',
+            'balloon_dijkstra_mission_node = robot_bringup.balloon_dijkstra_mission_node:main',
+            'map_path_visualizer = robot_bringup.map_path_visualizer:main',
             'safety_monitor = robot_bringup.safety_monitor:main',
         ],
     },
