@@ -35,7 +35,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='pi',
-    maintainer_email='clintosabi283@gmail.com',
+    maintainer_email='jerrykiche61@gamil.com',
     description='Bringup package for robot with LiDAR + IMU + SLAM',
     license='Apache-2.0',
     entry_points={
