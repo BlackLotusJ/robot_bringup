@@ -1,13 +1,23 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 import os
 from glob import glob
 
 package_name = 'robot_bringup'
 
+# Automatically find all Python scripts in robot_bringup/ and register them
+def generate_entry_points():
+    scripts = glob(os.path.join(package_name, "*.py"))
+    entry_points = []
+    for script in scripts:
+        name = os.path.splitext(os.path.basename(script))[0]
+        if name != "__init__":  # skip __init__.py
+            entry_points.append(f"{name} = {package_name}.{name}:main")
+    return entry_points
+
 setup(
     name=package_name,
     version='0.0.2',
-    packages=[package_name],
+    packages=find_packages(),
     py_modules=[],
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -39,12 +49,6 @@ setup(
     description='Bringup package for robot with LiDAR + IMU + SLAM',
     license='Apache-2.0',
     entry_points={
-        'console_scripts': [
-            'mapless_mission_controller = robot_bringup.mapless_mission_controller:main',
-            'mission_controller = robot_bringup.mission_controller:main',
-            'balloon_dijkstra_mission_node = robot_bringup.balloon_dijkstra_mission_node:main',
-            'map_path_visualizer = robot_bringup.map_path_visualizer:main',
-            'safety_monitor = robot_bringup.safety_monitor:main',
-        ],
+        'console_scripts': generate_entry_points(),
     },
 )
